@@ -4,16 +4,18 @@ from uuid import uuid4
 from os.path import dirname, basename, join as path_join
 from pprint import pprint
 from StringIO import StringIO
+from time import sleep
 
-from fabric.api import env, sudo, run, cd, put
-from fabric.decorators import task
-from fab_utils.fabfile.apt import install as apt_install
+from fabric.api import env, sudo, run, cd, put, settings as fabric_settings
+from fabric.decorators import task, hosts
 import pyrax
 from pyrax import connect_to_cloudservers
 from pyrax.utils import wait_until as pyrax_wait_until
 
 
-NOT_SPECIFIED = object()
+env.disable_known_hosts = True
+env.connection_attempts = 5
+
 
 def argparser_type(value):
     try:
@@ -79,13 +81,16 @@ class Deployer(object):
         'name_prefix', 'server_count', 'flavor_id', 'distro_id', 'git_repo',
         'destination_dir', 'copy_files', 'apt_packages', 'post_install',
         'restart_services', 'rackspace_username', 'rackspace_apikey',
-        'ssh_user', 'ssh_key_name'
+        'ssh_user', 'ssh_key_name', 'copy_ssh_public_key',
     )
+
+    GIT_HOSTS = ('bitbucket.org', 'github.com', )
 
     def __init__(self, task_kwargs=None, json_config_file='./deploy_settings.json'):
         self.cloudservers = None
         self.settings = {}
         self.fabric_env_servers = []
+        self.created_servers = []
 
         task_kwargs = task_kwargs or {}
 
@@ -110,6 +115,13 @@ class Deployer(object):
         pyrax.set_setting('identity_type', 'rackspace')
         pyrax.set_credentials(self.settings['rackspace_username'], self.settings['rackspace_apikey'])
         self.cloudservers = connect_to_cloudservers()
+
+    @property
+    def is_root(self):
+        return self.settings.get('ssh_user', None) == 'root'
+
+    def command(self, *args, **kwargs):
+        return (run if self.is_root else sudo)(*args, **kwargs)
 
     def read_settings_file(self, json_config_file):
         try:
@@ -143,12 +155,11 @@ class Deployer(object):
             return None
         return distros
 
-    # @add_hooks
     def get_servers(self):
         return self.cloudservers.servers.list()
 
     def hosts_list(self, servers):
-        return [sorted(server.networks['public'], key=len)[0] for server in servers]
+        return [server.accessIPv4 for server in servers]
 
     def create_servers(self):
         self.ensure_settings('name_prefix', 'server_count', 'flavor_id', 'distro_id', 'ssh_user')
@@ -156,7 +167,6 @@ class Deployer(object):
         flavor_obj = self.cloudservers.flavors.get(self.settings['flavor_id'])
         distro_obj = self.cloudservers.images.get(self.settings['distro_id'])
 
-        self.created_servers = []
         for counter in xrange(self.settings['server_count']):
             self.created_servers.append(self.cloudservers.servers.create(
                 name=self.settings['name_prefix'] + '_' + uuid4().hex,
@@ -180,61 +190,120 @@ class Deployer(object):
                 verbose=True
             )
 
+        refreshed_servers = []
+        for server_id in [srv.id for srv in self.created_servers]:
+            server = self.cloudservers.servers.get(server_id)
+            while getattr(server, 'accessIPv4', None) == [addr for addr in server.addresses['public'] if addr['version'] == 4][0]['addr']:
+                print 'Waiting for server {name} ({id}) to update it\'s public address...'.format(
+                    name=server.name,
+                    id=server.id,
+                )
+                sleep(2)
+                server = self.cloudservers.servers.get(server_id)
+            refreshed_servers.append(server)
+
+        self.created_servers = refreshed_servers
         self.fabric_env_servers = self.hosts_list(self.created_servers)
-
-        env.hosts = self.fabric_env_servers
-        env.user = self.settings['ssh_user']
-
         return self.created_servers
 
     def install_rackspace_agent(self):
-        if hasattr(self, 'fabric_env_servers'):
-            sudo('echo "deb http://stable.packages.cloudmonitoring.rackspace.com/ubuntu-14.04-x86_64 cloudmonitoring main" > /etc/apt/sources.list.d/rackspace-monitoring-agent.list', shell=True)
-            sudo('curl https://monitoring.api.rackspacecloud.com/pki/agent/linux.asc | sudo apt-key add -', shell=True)
-            sudo('aptitude update')
-            apt_install('rackspace-monitoring-agent')
-            put(local_path=StringIO('monitoring_token {token}'.format(token=pyrax.identity.identity.get_token())),
-                remote_path='/etc/rackspace-monitoring-agent.cfg', use_sudo=True)
-            sudo('service rackspace-monitoring-agent restart')
+        self.command('aptitude install curl -y -q=2')
+        self.command('echo "deb http://stable.packages.cloudmonitoring.rackspace.com/ubuntu-14.04-x86_64 cloudmonitoring main" > /etc/apt/sources.list.d/rackspace-monitoring-agent.list', shell=True)
+        self.command('curl https://monitoring.api.rackspacecloud.com/pki/agent/linux.asc | sudo apt-key add -', shell=True)
+        self.command('aptitude update -q=2')
+        self.command('aptitude install rackspace-monitoring-agent -y -q=2')
 
-    def install_apt_packages(self):
-        packages = self.settings.get('apt_packages', None)
-        if packages and hasattr(self, 'fabric_env_servers'):
-            env.hosts = self.fabric_env_servers
-            sudo('aptitude update')
-            sudo('aptitude safe-upgrade')
-            apt_install(packages)
+        put(local_path=StringIO('monitoring_token {token}'.format(token=pyrax.identity.get_token())),
+            remote_path='/etc/rackspace-monitoring-agent.cfg', use_sudo=self.is_root)
+        self.command('service rackspace-monitoring-agent restart')
+
+    def install_apt_packages(self, *packages):
+        packages = packages or self.settings.get('apt_packages', None)
+        if packages:
+            self.command('aptitude update -q=2')
+            self.command('aptitude install {packages} -y -q=2'.format(packages=' '.join(packages)))
+
+    def copy_ssh_public_key(self):
+        try:
+            copy_ssh_public_key = self.settings['copy_ssh_public_key']
+            if copy_ssh_public_key:
+                put(local_path='~/.ssh/id_rsa', remote_path='~/.ssh/id_rsa', mode=0600, use_sudo=self.is_root)
+                put(local_path='~/.ssh/id_rsa.pub', remote_path='~/.ssh/id_rsa.pub', mode=0600, use_sudo=self.is_root)
+        except KeyError:
+            pass
 
     def clone_repo(self):
         self.ensure_settings('git_repo', 'destination_dir', 'rackspace_username', 'rackspace_apikey')
+
+        self.command('touch ~/.ssh/known_hosts')
+        for ssh_host in self.GIT_HOSTS:
+            self.command('ssh-keyscan -t rsa,dsa {ssh_host} | sort -u - ~/.ssh/known_hosts > ~/.ssh/tmp_hosts'.format(ssh_host=ssh_host), shell=True)
+            self.command('cat ~/.ssh/tmp_hosts >> ~/.ssh/known_hosts', shell=True)
+
         destination_dir = self.settings['destination_dir']
-        if hasattr(self, 'fabric_env_servers'):
-            self.install_apt_packages('git')
-            parent_dir = dirname(destination_dir)
-            clone_dir = basename(destination_dir)
-            sudo('mkdir -p ' + destination_dir)
-            with cd(parent_dir):
-                sudo('git clone {repo_url} {directory}'.format(
+        self.install_apt_packages('git')
+        parent_dir = dirname(destination_dir)
+        clone_dir = basename(destination_dir)
+        self.command('mkdir -p ' + destination_dir)
+        with cd(parent_dir):
+            result = self.command(
+                'git clone -q {repo_url} {directory}'.format(
                     repo_url=self.settings['git_repo'],
                     directory=clone_dir,
-                ))
+                ),
+                warn_only=True
+            )
+        if not result.succeeded:
+            with cd(destination_dir):
+                self.command('git reset --hard')
+                self.command('git pull')
 
     def copy_files(self):
         self.ensure_settings('destination_dir')
-        env.hosts = self.fabric_env_servers
         copy_files_dict = self.settings.get('copy_files', {})
         assert isinstance(copy_files_dict, dict), 'The `copy_files` setting must be a mapping object'
         assert len([src_path for src_path in copy_files_dict.keys() if not src_path.startswith('/')]) == len(copy_files_dict.keys()), 'Some keys of the `copy_files` settings begin with a `/`. All source paths must be paths relative to the cloned repo.'
         assert len([dst_path for dst_path in copy_files_dict.values() if dst_path.startswith('/')]) == len(copy_files_dict.values()), 'Some keys of the `copy_files` settings do not begin with a `/` All destination paths must be absolute'
 
-        for src, dst in copy_files_dict.items():
-            sudo('cp -Rv {src} {dst}'.format(src=src, dst=dst))
+        with cd(self.settings['destination_dir']):
+            for src, dst in copy_files_dict.items():
+                self.command('cp -Rv {src} {dst}'.format(src=src, dst=dst))
 
-    def restart_services(self, servers):
+    def set_file_permissions(self):
+        destination_dir = self.settings.get('destination_dir', '')
+        permissions = self.settings.get('file_permissions', {})
+        if destination_dir and permissions:
+            with cd(destination_dir):
+                for filename, attributes in permissions:
+                    self.command('mkdir -p {dir}'.format(dir=dirname(filename)))
+                    self.command('touch {file}'.format(file=basename(filename)))
+
+                    if attributes.get('user', None) and attributes.get('group', None):
+                        owner = attributes['user'] + ':' + attributes['group']
+                    elif attributes.get('user', None):
+                        owner = attributes['user']
+                    elif attributes.get('group', None):
+                        owner = attributes['group']
+                    else:
+                        owner = ''
+
+                    if owner:
+                        self.command('chown -R {owner} {file}'.format(
+                            owner=owner,
+                            file=filename,
+                        ))
+
+                    if attributes.get('mode', None):
+                        self.command('chmod -R {mode} {file}'.format(
+                            mode=attributes['mode'],
+                            file=filename,
+                        ))
+
+
+    def restart_services(self):
         self.ensure_settings('restart_services')
-        env.hosts = self.hosts_list(servers)
         for service_name in self.settings['restart_services']:
-            sudo('service {service_name} restart'.format(service_name=service_name))
+            self.command('service {service_name} restart'.format(service_name=service_name))
 
 
 @task
@@ -272,34 +341,16 @@ def deploy(**task_kwargs):
     deployer = Deployer(task_kwargs=task_kwargs)
     pprint(deployer.settings)
     created_servers = deployer.create_servers()
-    print deployer.fabric_env_servers
 
-    print json.dumps([
-        {
-            # 'address': sorted(server.networks['public'], key=len)[0],
-            'networks': server.networks,
-            'name': server.name,
-            'id': server.id,
-        }
-        for server in created_servers])
-
-    deployer.install_rackspace_agent()
-    deployer.install_apt_packages()
-    deployer.clone_repo()
-    deployer.copy_files()
-
-    # for server in created_servers:
-    #     server.delete()
-
-    # for server in created_servers:
-    #     pyrax_wait_until(
-    #         server,
-    #         'status',
-    #         ['deleted', 'DELETED', ],
-    #         interval=3,
-    #         attempts=0,
-    #         verbose=True
-    #     )
+    for server in created_servers:
+        with fabric_settings(host_string=server.accessIPv4, user=deployer.settings['ssh_user']):
+            # deployer.install_rackspace_agent()
+            deployer.copy_ssh_public_key()
+            deployer.install_apt_packages()
+            deployer.clone_repo()
+            deployer.copy_files()
+            deployer.set_file_permissions()
+            deployer.restart_services()
 
 
 @task
