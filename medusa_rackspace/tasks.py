@@ -81,7 +81,7 @@ class Deployer(object):
         'name_prefix', 'server_count', 'flavor_id', 'distro_id', 'git_repo',
         'destination_dir', 'copy_files', 'apt_packages', 'post_install',
         'restart_services', 'rackspace_username', 'rackspace_apikey',
-        'ssh_user', 'ssh_key_name', 'copy_ssh_public_key',
+        'ssh_user', 'ssh_key_name', 'copy_ssh_public_key', 'file_permissions',
     )
 
     GIT_HOSTS = ('bitbucket.org', 'github.com', )
@@ -274,9 +274,9 @@ class Deployer(object):
         permissions = self.settings.get('file_permissions', {})
         if destination_dir and permissions:
             with cd(destination_dir):
-                for filename, attributes in permissions:
+                for filename, attributes in permissions.items():
                     self.command('mkdir -p {dir}'.format(dir=dirname(filename)))
-                    self.command('touch {file}'.format(file=basename(filename)))
+                    self.command('touch {file}'.format(file=filename))
 
                     if attributes.get('user', None) and attributes.get('group', None):
                         owner = attributes['user'] + ':' + attributes['group']
@@ -326,11 +326,11 @@ def list_servers(**task_kwargs):
     server_id = task_kwargs.get('server_id', None)
     for server in deployer.get_servers():
         if not server_id:
-            print '{name} ({id}) Status: {status}'.format(
+            print '{name} ({id}) Status: {status} [{address}]'.format(
                 id=server.id,
                 name=server.name,
                 status=server.status,
-                # networks=json.dumps(server.networks),  #  Networks: {networks}
+                address=server.accessIPv4,
             )
         elif server.id == server_id:
             pprint(server.__dict__)
@@ -339,7 +339,6 @@ def list_servers(**task_kwargs):
 @task
 def deploy(**task_kwargs):
     deployer = Deployer(task_kwargs=task_kwargs)
-    pprint(deployer.settings)
     created_servers = deployer.create_servers()
 
     for server in created_servers:
