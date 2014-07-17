@@ -82,6 +82,7 @@ class Deployer(object):
         'destination_dir', 'copy_files', 'apt_packages', 'post_install',
         'restart_services', 'rackspace_username', 'rackspace_apikey',
         'ssh_user', 'ssh_key_name', 'copy_ssh_public_key', 'file_permissions',
+        'after_git_repo',
     )
 
     GIT_HOSTS = ('bitbucket.org', 'github.com', )
@@ -257,6 +258,12 @@ class Deployer(object):
             with cd(destination_dir):
                 self.command('git reset --hard')
                 self.command('git pull')
+
+        commands_after_git_repo = self.settings.get('after_git_repo', None)
+        if isinstance(commands_after_git_repo, list):
+            with cd(destination_dir):
+                for cmd in commands_after_git_repo:
+                    self.command(cmd, shell=True)
 
     def copy_files(self):
         self.ensure_settings('destination_dir')
