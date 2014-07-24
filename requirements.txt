@@ -1,3 +1,3 @@
 Fabric==1.9.0
 pyrax==1.8.2
-git+https://github.com/jonathanmarmor/fab-utils.git#egg=fab-utils
+rackspace-monitoring==0.6.2

@@ -1,30 +1,22 @@
 import json
 from os import environ
 from uuid import uuid4
-from os.path import dirname, basename, join as path_join
+from os.path import dirname, basename
 from pprint import pprint
 from StringIO import StringIO
 from time import sleep
+from threading import Thread
 
-from fabric.api import env, sudo, run, cd, put, settings as fabric_settings
-from fabric.decorators import task, hosts
+from fabric.api import env, sudo, run, cd, put, execute
+from fabric.decorators import task, parallel
+
 import pyrax
-from pyrax import connect_to_cloudservers
-from pyrax.utils import wait_until as pyrax_wait_until
+from rackspace_monitoring.providers import get_driver as get_monitoring_driver
+from rackspace_monitoring.types import Provider as MonitoringProvider
 
 
 env.disable_known_hosts = True
 env.connection_attempts = 5
-
-
-def argparser_type(value):
-    try:
-        return json.loads(value)
-    except ValueError, original_error:
-        try:
-            return json.loads('"' + value + '"')
-        except ValueError:
-            raise original_error
 
 
 def add_hooks(method):
@@ -75,6 +67,54 @@ def ensure_settings(*settings):
     return actual_decorator
 
 
+class ServerWatcherThread(Thread):
+    expected_statuses = ['ACTIVE', 'ERROR', 'available', 'COMPLETED']
+
+    def __init__(self, deployer, server, initial_ip=None, callback=None,
+                 *callback_args, **callback_kwargs):
+        super(ServerWatcherThread, self).__init__()
+        self.server = server
+        self.deployer = deployer
+        self.initial_ip = initial_ip
+        self.callback = callback
+        self.callback_args = callback_args
+        self.callback_kwargs = callback_kwargs
+
+    @staticmethod
+    def server_public_addr(server):
+        try:
+            return [addr for addr in server.addresses['public'] if addr['version'] == 4][0]['addr']
+        except (KeyError, IndexError):
+            return getattr(server, 'accessIPv4', None)
+
+    def run(self):
+        while True:
+            sleep(2)
+            self.server = self.deployer.cloudservers.servers.get(self.server.id)
+            print 'Waiting for server {name} ({id}) to be ready... (Status: {status})'.format(
+                name=self.server.name,
+                id=self.server.id,
+                status=self.server.status,
+                address=getattr(self.server, 'accessIPv4', self.initial_ip),
+            )
+            if not self.server.status in self.expected_statuses:
+                continue
+
+            print 'Waiting for server {name} ({id}) to be accesible... (Current: {address})'.format(
+                name=self.server.name,
+                id=self.server.id,
+                status=self.server.status,
+                address=getattr(self.server, 'accessIPv4', self.initial_ip),
+            )
+            if getattr(self.server, 'accessIPv4', self.initial_ip) == self.server_public_addr(self.server):
+                continue
+            # All tests passed, break the pooling cycle
+            break
+
+        if self.callback:
+            self.callback(self.server, *self.callback_args, **self.callback_kwargs)
+
+
 class Deployer(object):
 
     SETTINGS_KEYS = (
@@ -87,7 +127,8 @@ class Deployer(object):
 
     GIT_HOSTS = ('bitbucket.org', 'github.com', )
 
-    def __init__(self, task_kwargs=None, json_config_file='./deploy_settings.json'):
+    def __init__(self, task_kwargs=None, json_config_file=None):
+        json_config_file = json_config_file or './deploy_settings.json'
         self.cloudservers = None
         self.settings = {}
         self.fabric_env_servers = []
@@ -114,8 +155,10 @@ class Deployer(object):
         self.ensure_settings('rackspace_username', 'rackspace_apikey')
 
         pyrax.set_setting('identity_type', 'rackspace')
-        pyrax.set_credentials(self.settings['rackspace_username'], self.settings['rackspace_apikey'])
-        self.cloudservers = connect_to_cloudservers()
+        pyrax.set_credentials(
+            self.settings['rackspace_username'],
+            self.settings['rackspace_apikey'])
+        self.cloudservers = pyrax.connect_to_cloudservers()
 
     @property
     def is_root(self):
@@ -159,11 +202,9 @@ class Deployer(object):
     def get_servers(self):
         return self.cloudservers.servers.list()
 
-    def hosts_list(self, servers):
-        return [server.accessIPv4 for server in servers]
-
     def create_servers(self):
-        self.ensure_settings('name_prefix', 'server_count', 'flavor_id', 'distro_id', 'ssh_user')
+        self.ensure_settings(
+            'name_prefix', 'server_count', 'flavor_id', 'distro_id', 'ssh_user')
 
         flavor_obj = self.cloudservers.flavors.get(self.settings['flavor_id'])
         distro_obj = self.cloudservers.images.get(self.settings['distro_id'])
@@ -180,32 +221,22 @@ class Deployer(object):
                     {'uuid': '00000000-0000-0000-0000-000000000000', },
                 ]
             ))
-
-        for server in self.created_servers:
-            pyrax_wait_until(
-                server,
-                'status',
-                ['active', 'ACTIVE', ],
-                interval=3,
-                attempts=0,
-                verbose=True
-            )
-
-        refreshed_servers = []
-        for server_id in [srv.id for srv in self.created_servers]:
-            server = self.cloudservers.servers.get(server_id)
-            while getattr(server, 'accessIPv4', None) == [addr for addr in server.addresses['public'] if addr['version'] == 4][0]['addr']:
-                print 'Waiting for server {name} ({id}) to update it\'s public address...'.format(
-                    name=server.name,
-                    id=server.id,
-                )
-                sleep(2)
-                server = self.cloudservers.servers.get(server_id)
-            refreshed_servers.append(server)
-
-        self.created_servers = refreshed_servers
-        self.fabric_env_servers = self.hosts_list(self.created_servers)
         return self.created_servers
+
+    def wait_for_active(self, servers=None,
+                        callback=None, *callback_args, **callback_kwargs):
+        threads = []
+        for server in servers or self.created_servers:
+            thread = ServerWatcherThread(
+                self, server, initial_ip=ServerWatcherThread.server_public_addr(server),
+                callback=callback, *callback_args, **callback_kwargs)
+            threads.append(thread)
+            thread.start()
+
+        for thread in threads:
+            thread.join()
+
+        return [thread.server for thread in threads]
 
     def install_rackspace_agent(self):
         self.command('aptitude install curl -y -q=2')
@@ -214,7 +245,14 @@ class Deployer(object):
         self.command('aptitude update -q=2')
         self.command('aptitude install rackspace-monitoring-agent -y -q=2')
 
-        put(local_path=StringIO('monitoring_token {token}'.format(token=pyrax.identity.get_token())),
+        monitoring_driver = get_monitoring_driver(MonitoringProvider.RACKSPACE)
+        monitoring_driver_instance = monitoring_driver(self.settings['rackspace_username'], self.settings['rackspace_apikey'])
+        token = monitoring_driver_instance.create_agent_token(label='generated-{prefix}-{server}'.format(
+            prefix=self.settings.get('name_prefix', uuid4()),
+            server=env.host_string,
+        ))
+
+        put(local_path=StringIO('monitoring_token {token}'.format(token=token.token)),
             remote_path='/etc/rackspace-monitoring-agent.cfg', use_sudo=self.is_root)
         self.command('service rackspace-monitoring-agent restart')
 
@@ -222,23 +260,32 @@ class Deployer(object):
         packages = packages or self.settings.get('apt_packages', None)
         if packages:
             self.command('aptitude update -q=2')
-            self.command('aptitude install {packages} -y -q=2'.format(packages=' '.join(packages)))
+            self.command('aptitude install {packages} -y -q=2'.format(
+                packages=' '.join(packages)
+            ))
 
     def copy_ssh_public_key(self):
         try:
             copy_ssh_public_key = self.settings['copy_ssh_public_key']
             if copy_ssh_public_key:
-                put(local_path='~/.ssh/id_rsa', remote_path='~/.ssh/id_rsa', mode=0600, use_sudo=self.is_root)
-                put(local_path='~/.ssh/id_rsa.pub', remote_path='~/.ssh/id_rsa.pub', mode=0600, use_sudo=self.is_root)
+                put(local_path='~/.ssh/id_rsa', remote_path='~/.ssh/id_rsa',
+                    mode=0600, use_sudo=self.is_root)
+                put(local_path='~/.ssh/id_rsa.pub', remote_path='~/.ssh/id_rsa.pub',
+                    mode=0600, use_sudo=self.is_root)
         except KeyError:
             pass
 
     def clone_repo(self):
-        self.ensure_settings('git_repo', 'destination_dir', 'rackspace_username', 'rackspace_apikey')
+        self.ensure_settings(
+            'git_repo', 'destination_dir', 'rackspace_username', 'rackspace_apikey')
 
         self.command('touch ~/.ssh/known_hosts')
         for ssh_host in self.GIT_HOSTS:
-            self.command('ssh-keyscan -t rsa,dsa {ssh_host} | sort -u - ~/.ssh/known_hosts > ~/.ssh/tmp_hosts'.format(ssh_host=ssh_host), shell=True)
+            self.command(
+                'ssh-keyscan -t rsa,dsa {ssh_host} | '
+                'sort -u - ~/.ssh/known_hosts > '
+                '~/.ssh/tmp_hosts'.format(ssh_host=ssh_host),
+                shell=True)
             self.command('cat ~/.ssh/tmp_hosts >> ~/.ssh/known_hosts', shell=True)
 
         destination_dir = self.settings['destination_dir']
@@ -263,7 +310,7 @@ class Deployer(object):
         if isinstance(commands_after_git_repo, list):
             with cd(destination_dir):
                 for cmd in commands_after_git_repo:
-                    self.command(cmd, shell=True)
+                    self.command(cmd, shell=True, warn_only=True)
 
     def copy_files(self):
         self.ensure_settings('destination_dir')
@@ -345,18 +392,40 @@ def list_servers(**task_kwargs):
 
 @task
 def deploy(**task_kwargs):
-    deployer = Deployer(task_kwargs=task_kwargs)
-    created_servers = deployer.create_servers()
+    settings_file = task_kwargs.pop('settings_file', None)
+    server_list = task_kwargs.pop('server_list', None)
 
-    for server in created_servers:
-        with fabric_settings(host_string=server.accessIPv4, user=deployer.settings['ssh_user']):
-            # deployer.install_rackspace_agent()
-            deployer.copy_ssh_public_key()
-            deployer.install_apt_packages()
-            deployer.clone_repo()
-            deployer.copy_files()
-            deployer.set_file_permissions()
-            deployer.restart_services()
+    deployer = Deployer(task_kwargs=task_kwargs, json_config_file=settings_file)
+
+    if isinstance(server_list, basestring):
+        server_list = [server_list]
+
+    def server_from_id(_id):
+        for server in deployer.cloudservers.servers.list():
+            for attr in ('name', 'id', 'accessIPv4', ):
+                if getattr(server, attr, None) == _id:
+                    return server
+
+    if server_list:
+        server_list = [srv for srv in [server_from_id(_id) for _id in server_list] if srv]
+        assert server_list, 'Invalid server list'
+    else:
+        server_list = deployer.create_servers()
+
+    env.user = deployer.settings['ssh_user']
+
+    server_list = deployer.wait_for_active(server_list)
+
+    def start_deploy():
+        # deployer.install_rackspace_agent()
+        deployer.copy_ssh_public_key()
+        deployer.install_apt_packages()
+        deployer.clone_repo()
+        deployer.copy_files()
+        deployer.set_file_permissions()
+        deployer.restart_services()
+
+    execute(parallel(start_deploy), hosts=[srv.accessIPv4 for srv in server_list])
 
 
 @task
