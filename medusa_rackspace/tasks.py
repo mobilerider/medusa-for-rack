@@ -1,4 +1,5 @@
 import json
+import getpass
 from os import environ
 from uuid import uuid4
 from os.path import dirname, basename
@@ -6,9 +7,11 @@ from pprint import pprint
 from StringIO import StringIO
 from time import sleep
 from threading import Thread
+from urlparse import urlparse, urlunparse
 
-from fabric.api import env, sudo, run, cd, put, execute
+from fabric.api import env, sudo, run, cd, put, execute, prompt
 from fabric.decorators import task, parallel
+from fabric.utils import _AttributeDict as AttributeDict
 
 import pyrax
 from rackspace_monitoring.providers import get_driver as get_monitoring_driver
@@ -91,23 +94,24 @@ class ServerWatcherThread(Thread):
         while True:
             sleep(2)
             self.server = self.deployer.cloudservers.servers.get(self.server.id)
-            print 'Waiting for server {name} ({id}) to be ready... (Status: {status})'.format(
-                name=self.server.name,
-                id=self.server.id,
-                status=self.server.status,
-                address=getattr(self.server, 'accessIPv4', self.initial_ip),
-            )
             if not self.server.status in self.expected_statuses:
+                print 'Waiting for server {name} ({id}) to be ready... (Status: {status})'.format(
+                    name=self.server.name,
+                    id=self.server.id,
+                    status=self.server.status,
+                    address=getattr(self.server, 'accessIPv4', self.initial_ip),
+                )
                 continue
 
-            print 'Waiting for server {name} ({id}) to be accesible... (Current: {address})'.format(
-                name=self.server.name,
-                id=self.server.id,
-                status=self.server.status,
-                address=getattr(self.server, 'accessIPv4', self.initial_ip),
-            )
             if getattr(self.server, 'accessIPv4', self.initial_ip) == self.server_public_addr(self.server):
+                print 'Waiting for server {name} ({id}) to be accesible... (Current: {address})'.format(
+                    name=self.server.name,
+                    id=self.server.id,
+                    status=self.server.status,
+                    address=getattr(self.server, 'accessIPv4', self.initial_ip),
+                )
                 continue
+
             # All tests passed, break the pooling cycle
             break
 
@@ -122,7 +126,7 @@ class Deployer(object):
         'destination_dir', 'copy_files', 'apt_packages', 'post_install',
         'restart_services', 'rackspace_username', 'rackspace_apikey',
         'ssh_user', 'ssh_key_name', 'copy_ssh_public_key', 'file_permissions',
-        'after_git_repo',
+        'after_git_repo', 'git_repo_username', 'git_repo_password',
     )
 
     GIT_HOSTS = ('bitbucket.org', 'github.com', )
@@ -130,7 +134,7 @@ class Deployer(object):
     def __init__(self, task_kwargs=None, json_config_file=None):
         json_config_file = json_config_file or './deploy_settings.json'
         self.cloudservers = None
-        self.settings = {}
+        self.settings = AttributeDict({})
         self.fabric_env_servers = []
         self.created_servers = []
 
@@ -150,14 +154,14 @@ class Deployer(object):
                     except KeyError:
                         pass
 
-        self.settings['server_count'] = int(self.settings['server_count'])
+        self.settings.server_count = int(self.settings.server_count)
         self.settings.setdefault('ssh_user', 'root')
         self.ensure_settings('rackspace_username', 'rackspace_apikey')
 
         pyrax.set_setting('identity_type', 'rackspace')
         pyrax.set_credentials(
-            self.settings['rackspace_username'],
-            self.settings['rackspace_apikey'])
+            self.settings.rackspace_username,
+            self.settings.rackspace_apikey)
         self.cloudservers = pyrax.connect_to_cloudservers()
 
     @property
@@ -206,12 +210,12 @@ class Deployer(object):
         self.ensure_settings(
             'name_prefix', 'server_count', 'flavor_id', 'distro_id', 'ssh_user')
 
-        flavor_obj = self.cloudservers.flavors.get(self.settings['flavor_id'])
-        distro_obj = self.cloudservers.images.get(self.settings['distro_id'])
+        flavor_obj = self.cloudservers.flavors.get(self.settings.flavor_id)
+        distro_obj = self.cloudservers.images.get(self.settings.distro_id)
 
-        for counter in xrange(self.settings['server_count']):
+        for counter in xrange(self.settings.server_count):
             self.created_servers.append(self.cloudservers.servers.create(
-                name=self.settings['name_prefix'] + '_' + uuid4().hex,
+                name=self.settings.name_prefix + '_' + uuid4().hex,
                 image=distro_obj,
                 flavor=flavor_obj,
                 availability_zone=self.settings.get('availability_zone', 'DFW'),
@@ -246,7 +250,7 @@ class Deployer(object):
         self.command('aptitude install rackspace-monitoring-agent -y -q=2')
 
         monitoring_driver = get_monitoring_driver(MonitoringProvider.RACKSPACE)
-        monitoring_driver_instance = monitoring_driver(self.settings['rackspace_username'], self.settings['rackspace_apikey'])
+        monitoring_driver_instance = monitoring_driver(self.settings.rackspace_username, self.settings.rackspace_apikey)
         token = monitoring_driver_instance.create_agent_token(label='generated-{prefix}-{server}'.format(
             prefix=self.settings.get('name_prefix', uuid4()),
             server=env.host_string,
@@ -264,31 +268,30 @@ class Deployer(object):
                 packages=' '.join(packages)
             ))
 
-    def copy_ssh_public_key(self):
-        try:
-            copy_ssh_public_key = self.settings['copy_ssh_public_key']
-            if copy_ssh_public_key:
-                put(local_path='~/.ssh/id_rsa', remote_path='~/.ssh/id_rsa',
-                    mode=0600, use_sudo=self.is_root)
-                put(local_path='~/.ssh/id_rsa.pub', remote_path='~/.ssh/id_rsa.pub',
-                    mode=0600, use_sudo=self.is_root)
-        except KeyError:
-            pass
+    def format_repo_url(self, repo_url=None, save=True):
+        repo_url_parsed = urlparse(repo_url or self.settings.repo_url, 'https')
+        settings_git_repo_username = self.settings.get('git_repo_username', repo_url_parsed.username or '')
+        settings_git_repo_password = self.settings.get('git_repo_password', repo_url_parsed.password or '')
+        auth_string = ''
+        if settings_git_repo_username:
+            auth_string = settings_git_repo_username
+            if settings_git_repo_password:
+                auth_string += ':' + settings_git_repo_password
+            auth_string +=  '@'
+        new_url = list(repo_url_parsed)
+        new_url[1] = auth_string + \
+            repo_url_parsed.hostname + \
+            ((':' + str(repo_url_parsed.port)) if repo_url_parsed.port else '')
+        new_url = urlunparse(new_url)
+        if save:
+            self.settings['git_repo'] = new_url
+        return new_url
 
     def clone_repo(self):
-        self.ensure_settings(
-            'git_repo', 'destination_dir', 'rackspace_username', 'rackspace_apikey')
+        self.ensure_settings('git_repo', 'destination_dir')
+        self.format_repo_url(self.settings.git_repo, save=True)
 
-        self.command('touch ~/.ssh/known_hosts')
-        for ssh_host in self.GIT_HOSTS:
-            self.command(
-                'ssh-keyscan -t rsa,dsa {ssh_host} | '
-                'sort -u - ~/.ssh/known_hosts > '
-                '~/.ssh/tmp_hosts'.format(ssh_host=ssh_host),
-                shell=True)
-            self.command('cat ~/.ssh/tmp_hosts >> ~/.ssh/known_hosts', shell=True)
-
-        destination_dir = self.settings['destination_dir']
+        destination_dir = self.settings.destination_dir
         self.install_apt_packages('git')
         parent_dir = dirname(destination_dir)
         clone_dir = basename(destination_dir)
@@ -296,7 +299,7 @@ class Deployer(object):
         with cd(parent_dir):
             result = self.command(
                 'git clone -q {repo_url} {directory}'.format(
-                    repo_url=self.settings['git_repo'],
+                    repo_url=self.settings.git_repo,
                     directory=clone_dir,
                 ),
                 warn_only=True
@@ -319,7 +322,7 @@ class Deployer(object):
         assert len([src_path for src_path in copy_files_dict.keys() if not src_path.startswith('/')]) == len(copy_files_dict.keys()), 'Some keys of the `copy_files` settings begin with a `/`. All source paths must be paths relative to the cloned repo.'
         assert len([dst_path for dst_path in copy_files_dict.values() if dst_path.startswith('/')]) == len(copy_files_dict.values()), 'Some keys of the `copy_files` settings do not begin with a `/` All destination paths must be absolute'
 
-        with cd(self.settings['destination_dir']):
+        with cd(self.settings.destination_dir):
             for src, dst in copy_files_dict.items():
                 self.command('cp -Rv {src} {dst}'.format(src=src, dst=dst))
 
@@ -356,7 +359,7 @@ class Deployer(object):
 
     def restart_services(self):
         self.ensure_settings('restart_services')
-        for service_name in self.settings['restart_services']:
+        for service_name in self.settings.restart_services:
             self.command('service {service_name} restart'.format(service_name=service_name))
 
 
@@ -395,6 +398,16 @@ def deploy(**task_kwargs):
     settings_file = task_kwargs.pop('settings_file', None)
     server_list = task_kwargs.pop('server_list', None)
 
+    ask_for_repo_auth = task_kwargs.pop('ask_for_git_auth', False)
+    if ask_for_repo_auth:
+        print 'Enter the username/password for when cloning the Git repository ' + \
+              ' (these will override any username/password already on the Git HTTPS URL)'
+        git_repo_username = prompt('Repository username:', default=getpass.getuser())
+        git_repo_password = getpass.getpass('Repository password: ')
+        if git_repo_username:
+            task_kwargs['git_repo_username'] = git_repo_username
+            task_kwargs['git_repo_password'] = git_repo_password
+
     deployer = Deployer(task_kwargs=task_kwargs, json_config_file=settings_file)
 
     if isinstance(server_list, basestring):
@@ -412,13 +425,12 @@ def deploy(**task_kwargs):
     else:
         server_list = deployer.create_servers()
 
-    env.user = deployer.settings['ssh_user']
+    env.user = deployer.settings.ssh_user
 
     server_list = deployer.wait_for_active(server_list)
 
     def start_deploy():
         # deployer.install_rackspace_agent()
-        deployer.copy_ssh_public_key()
         deployer.install_apt_packages()
         deployer.clone_repo()
         deployer.copy_files()
