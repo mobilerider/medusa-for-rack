@@ -103,6 +103,12 @@ class ServerWatcherThread(Thread):
                 )
                 continue
 
+            if self.server.status in ('error', 'ERROR', ):
+                raise Exception('Server {name} ({id}) finished with "ERROR" status'.format(
+                    name=self.server.name,
+                    id=self.server.id,
+                ))
+
             if getattr(self.server, 'accessIPv4', self.initial_ip) == self.server_public_addr(self.server):
                 print 'Waiting for server {name} ({id}) to be accesible... (Current: {address})'.format(
                     name=self.server.name,
@@ -240,7 +246,13 @@ class Deployer(object):
         for thread in threads:
             thread.join()
 
-        return [thread.server for thread in threads]
+        return [
+            thread.server for thread in threads
+                if thread.server.status in (
+                    'ACTIVE', 'active', 'available',
+                    'AVAILABLE', 'COMPLETED', 'completed'
+                )
+        ]
 
     def install_rackspace_agent(self):
         self.command('aptitude install curl -y -q=2')
