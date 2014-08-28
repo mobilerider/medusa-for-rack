@@ -11,6 +11,7 @@ from urlparse import urlparse, urlunparse
 
 from fabric.api import env, sudo, run, cd, put, execute, prompt
 from fabric.decorators import task, parallel
+from fabric.context_managers import shell_env
 from fabric.utils import _AttributeDict as AttributeDict
 
 import pyrax
@@ -132,7 +133,9 @@ class Deployer(object):
         'destination_dir', 'copy_files', 'apt_packages', 'post_install',
         'restart_services', 'rackspace_username', 'rackspace_apikey',
         'ssh_user', 'ssh_key_name', 'copy_ssh_public_key', 'file_permissions',
-        'after_git_repo', 'git_repo_username', 'git_repo_password',
+        'after_git_repo', 'after_git_repo_single', 'git_repo_username',
+        'git_repo_password', 'git_branch', 'environment', 'load_balancer',
+        'load_balancer_access_port', 'load_balancer_clear_nodes',
     )
 
     GIT_HOSTS = ('bitbucket.org', 'github.com', )
@@ -162,6 +165,7 @@ class Deployer(object):
 
         self.settings.server_count = int(self.settings.server_count)
         self.settings.setdefault('ssh_user', 'root')
+        self.settings.setdefault('git_branch', 'master')
         self.ensure_settings('rackspace_username', 'rackspace_apikey')
 
         pyrax.set_setting('identity_type', 'rackspace')
@@ -169,13 +173,16 @@ class Deployer(object):
             self.settings.rackspace_username,
             self.settings.rackspace_apikey)
         self.cloudservers = pyrax.connect_to_cloudservers()
+        self.loadbalancers = pyrax.connect_to_cloud_loadbalancers()
 
     @property
     def is_root(self):
         return self.settings.get('ssh_user', None) == 'root'
 
     def command(self, *args, **kwargs):
-        return (run if self.is_root else sudo)(*args, **kwargs)
+        command_environment = kwargs.pop('command_environment', {})
+        with shell_env(**command_environment):
+            return (run if self.is_root else sudo)(*args, **kwargs)
 
     def read_settings_file(self, json_config_file):
         try:
@@ -300,7 +307,7 @@ class Deployer(object):
         return new_url
 
     def clone_repo(self):
-        self.ensure_settings('git_repo', 'destination_dir')
+        self.ensure_settings('git_repo', 'git_branch', 'destination_dir')
         self.format_repo_url(self.settings.git_repo, save=True)
 
         destination_dir = self.settings.destination_dir
@@ -321,11 +328,30 @@ class Deployer(object):
                 self.command('git reset --hard')
                 self.command('git pull')
 
+        with cd(destination_dir):
+            self.command('git checkout {branch}'.format(branch=self.settings.git_branch))
+
+    def run_custom_commands(self):
+        self.ensure_settings('destination_dir')
+        destination_dir = self.settings.destination_dir
+        commands_environment = self.settings.get('environment', {})
+
         commands_after_git_repo = self.settings.get('after_git_repo', None)
         if isinstance(commands_after_git_repo, list):
             with cd(destination_dir):
                 for cmd in commands_after_git_repo:
-                    self.command(cmd, shell=True, warn_only=True)
+                    self.command(cmd, shell=True, warn_only=True, command_environment=commands_environment)
+
+    def run_one_time_custom_commands(self):
+        self.ensure_settings('destination_dir')
+        destination_dir = self.settings.destination_dir
+        commands_environment = self.settings.get('environment', {})
+
+        commands_after_git_repo_single = self.settings.get('after_git_repo_single', None)
+        if isinstance(commands_after_git_repo_single, list):
+            with cd(destination_dir):
+                for cmd in commands_after_git_repo_single:
+                    self.command(cmd, shell=True, warn_only=True, command_environment=commands_environment)
 
     def copy_files(self):
         self.ensure_settings('destination_dir')
@@ -373,6 +399,70 @@ class Deployer(object):
         self.ensure_settings('restart_services')
         for service_name in self.settings.restart_services:
             self.command('service {service_name} restart'.format(service_name=service_name))
+
+    def register_with_load_balancer(self, addresses):
+        load_balancer_id = self.settings.get('load_balancer', None)
+        load_balancer_port = self.settings.get('load_balancer_access_port', 80)
+        load_balancer_clear_nodes = self.settings.get('load_balancer_clear_nodes', False)
+
+        if not load_balancer_id:
+            print 'No load balancer ID/Name specified - skipping step'
+            return
+
+        load_balancer_instance = None
+        for load_balancer in self.loadbalancers.list():
+            if str(load_balancer_id) in (str(load_balancer.id), str(load_balancer.name), ):
+                load_balancer_instance = load_balancer
+                break
+
+        if not load_balancer_instance:
+            print 'No load balancer with ID/Name `{id}` can be found'.format(id=load_balancer_id)
+            return
+
+        if load_balancer_instance.status != 'ACTIVE':
+            print 'The load balancer {name} ({id}) is not yet active, status {status}'.format(
+                name=load_balancer_instance.name,
+                id=load_balancer_instance.id,
+                status=load_balancer_instance.status,
+            )
+            return
+
+        if load_balancer_clear_nodes and load_balancer_instance.nodeCount:
+            print 'Clearing nodes from load balancer {name} ({id})'.format(
+                name=load_balancer_instance.name,
+                id=load_balancer_instance.id,
+            )
+            for node in load_balancer_instance.nodes:
+                print 'Removing node {node}...'.format(node=node)
+                load_balancer_instance.delete_node(node)
+
+                load_balancer_instance = self.loadbalancers.get(load_balancer_instance.id)
+                print 'Waiting for load balancer {name} ({id}) to become active, status: {status}'.format(
+                    name=load_balancer_instance.name,
+                    id=load_balancer_instance.id,
+                    status=load_balancer_instance.status,
+                )
+                while load_balancer_instance.status not in ('active', 'ACTIVE', ):
+                    load_balancer_instance = self.loadbalancers.get(load_balancer_instance.id)
+
+        node_cls = pyrax.cloudloadbalancers.Node
+
+        print 'Adding nodes: {nodes}'.format(nodes=repr(addresses))
+        load_balancer_instance.add_nodes([
+            node_cls(address=address, port=load_balancer_port)
+            for address in addresses
+        ])
+
+        load_balancer_instance = self.loadbalancers.get(load_balancer_instance.id)
+        print 'Waiting for load balancer {name} ({id}) to become active, status: {status}'.format(
+            name=load_balancer_instance.name,
+            id=load_balancer_instance.id,
+            status=load_balancer_instance.status,
+        )
+        while load_balancer_instance.status not in ('active', 'ACTIVE', ):
+            load_balancer_instance = self.loadbalancers.get(load_balancer_instance.id)
+
+        return load_balancer_instance
 
 
 @task
@@ -447,9 +537,15 @@ def deploy(**task_kwargs):
         deployer.clone_repo()
         deployer.copy_files()
         deployer.set_file_permissions()
+        deployer.run_custom_commands()
         deployer.restart_services()
 
     execute(parallel(start_deploy), hosts=[srv.accessIPv4 for srv in server_list])
+    execute(deployer.run_one_time_custom_commands, hosts=server_list[0].accessIPv4)
+    deployer.register_with_load_balancer([
+        [addr for addr in srv.addresses['private'] if addr['version'] == 4][0]['addr']
+        for srv in server_list
+    ])
 
 
 @task
