@@ -135,7 +135,7 @@ class Deployer(object):
         'ssh_user', 'ssh_key_name', 'copy_ssh_public_key', 'file_permissions',
         'after_git_repo', 'after_git_repo_single', 'git_repo_username',
         'git_repo_password', 'git_branch', 'environment', 'load_balancer',
-        'load_balancer_access_port', 'load_balancer_clear_nodes',
+        'load_balancer_access_port', 'load_balancer_clear_nodes', 'initial_commands',
     )
 
     GIT_HOSTS = ('bitbucket.org', 'github.com', )
@@ -278,6 +278,14 @@ class Deployer(object):
         put(local_path=StringIO('monitoring_token {token}'.format(token=token.token)),
             remote_path='/etc/rackspace-monitoring-agent.cfg', use_sudo=self.is_root)
         self.command('service rackspace-monitoring-agent restart')
+
+    def run_initial_commands(self):
+        initial_commands = self.settings.get('initial_commands', [])
+        commands_environment = self.settings.get('environment', {})
+        if initial_commands:
+            with cd('/'):
+                for command in initial_commands:
+                    self.command(command, shell=True, warn_only=True, command_environment=commands_environment)
 
     def install_apt_packages(self, *packages):
         packages = packages or self.settings.get('apt_packages', None)
@@ -533,6 +541,7 @@ def deploy(**task_kwargs):
 
     def start_deploy():
         # deployer.install_rackspace_agent()
+        deployer.run_initial_commands()
         deployer.install_apt_packages()
         deployer.clone_repo()
         deployer.copy_files()
